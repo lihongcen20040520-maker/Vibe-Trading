@@ -13,6 +13,7 @@ import json
 import math
 import re
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlsplit
@@ -542,13 +543,100 @@ def _is_reader_metadata(path: str) -> bool:
 def _coerce_quote_text(path: str, value: str) -> float | None:
     """Parse a quote leaf written as text (``\"2246.35\"``, ``\"2,246.35\"``).
 
-    Only unambiguous quote leaves are coerced. A status code, volume or
-    timestamp that the venue encoded as a string stays out of the ledger, so
-    a small integer in the body cannot satisfy a price citation by coincidence.
+    Only unambiguous quote leaves are coerced. A status code or volume that
+    the venue encoded as a string stays out of the ledger, so a small integer
+    in the body cannot satisfy a price citation by coincidence. A source
+    ``ts`` is not a quote; :func:`_coerce_timestamp_text` records it separately.
     """
     if _price_field_for_path(path) is None:
         return None
     return _coerce_csv_number(value)
+
+
+# OKX public tickers name the source instant ``ts`` and send it as a digit
+# string. Only a unix second (10 digits) or millisecond (13 digits) inside
+# 2001-09-09 .. 2100-01-01 is that instant. Other ``ts`` strings, volumes,
+# and wrapper lengths are not.
+_READER_TIMESTAMP_FIELDS = frozenset({"ts"})
+_EPOCH_SECONDS_MIN = 1_000_000_000
+_EPOCH_SECONDS_MAX = 4_102_444_800
+_EPOCH_MILLIS_MIN = _EPOCH_SECONDS_MIN * 1000
+_EPOCH_MILLIS_MAX = _EPOCH_SECONDS_MAX * 1000
+_ISO_UTC_STAMP_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\.\d{3}(?:Z|[+-]\d{2}:\d{2})"
+)
+
+
+def _epoch_value(text: str) -> int | None:
+    """A unix second or millisecond, or None when ``text`` is not one."""
+    body = str(text or "").strip()
+    if len(body) not in (10, 13) or not body.isdigit() or body[0] == "0":
+        return None
+    value = int(body)
+    bounds = (_EPOCH_MILLIS_MIN, _EPOCH_MILLIS_MAX) if len(body) == 13 else (
+        _EPOCH_SECONDS_MIN, _EPOCH_SECONDS_MAX
+    )
+    if bounds[0] <= value <= bounds[1]:
+        return value
+    return None
+
+
+def _is_source_epoch(value: float) -> bool:
+    """Whether a prose figure has the magnitude of a source ``ts``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if not math.isfinite(float(value)) or float(value) < 0 or float(value) != int(value):
+        return False
+    return _epoch_value(str(int(value))) is not None
+
+
+def _coerce_timestamp_text(path: str, value: str) -> int | None:
+    """The source instant on a ``ts`` leaf, or None for any other string."""
+    if _leaf_name(path) not in _READER_TIMESTAMP_FIELDS:
+        return None
+    return _epoch_value(value)
+
+
+def _epoch_millis(value: int) -> int:
+    """Normalize a 10-digit second or 13-digit millisecond instant to milliseconds."""
+    return value if value >= _EPOCH_MILLIS_MIN else value * 1000
+
+
+def _iso_stamp_millis(stamp: str) -> int | None:
+    """Parse one millisecond ISO-8601 instant to epoch milliseconds.
+
+    ``Z`` and numeric offsets are applied. A stamp that does not name
+    milliseconds, or that has no timezone, is not a source-time restatement.
+    """
+    normalized = stamp.strip().replace(" ", "T").replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    delta = parsed.astimezone(timezone.utc) - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return (
+        delta.days * 86_400_000
+        + delta.seconds * 1000
+        + delta.microseconds // 1000
+    )
+
+
+def utc_restatement_mismatch(segment: str, epoch: int) -> bool:
+    """Whether a millisecond clock time in ``segment`` is not ``epoch``.
+
+    No clock time is not a mismatch: the raw ``ts`` digits are enough.
+    A clock time that is present must be that instant. ``+08:00`` is the
+    same instant as ``Z`` only when the clock is shifted by the offset.
+    """
+    if not _is_source_epoch(epoch):
+        return False
+    target = _epoch_millis(int(epoch))
+    stamps = _ISO_UTC_STAMP_RE.findall(segment or "")
+    if not stamps:
+        return False
+    return any(_iso_stamp_millis(stamp) != target for stamp in stamps)
 
 
 def _json_documents(text: str, depth: int = 0) -> list[Any]:
@@ -1627,6 +1715,8 @@ class _EvidenceMixin:
                             )
                         return
                 coerced = _coerce_quote_text(path, value)
+                if coerced is None:
+                    coerced = _coerce_timestamp_text(path, value)
                 if coerced is not None:
                     visit(
                         coerced,
@@ -1638,9 +1728,17 @@ class _EvidenceMixin:
                     )
                 return
             if _is_number(value):
+                source_time = (
+                    tool_name == "read_url"
+                    and _leaf_name(path) in _READER_TIMESTAMP_FIELDS
+                )
                 if tool_name == "read_url" and (
                     _is_reader_metadata(path) or (multi_instrument and not chosen)
                 ):
+                    return
+                # A ``ts`` that is not a unix instant is not source time and
+                # is not a price. Drop it rather than let a short integer in.
+                if source_time and not _is_source_epoch(value):
                     return
                 self._evidence.append(
                     EvidenceRecord(
@@ -1653,15 +1751,19 @@ class _EvidenceMixin:
                         value=value,
                         status="observed",
                         currency=(
-                            metric_currency
-                            if tool_name == "get_sec_filings"
-                            and path.startswith("data.metric.points[")
-                            and path.endswith("].val")
+                            None
+                            if source_time
                             else (
-                                declared_currency
-                                if declared_currency
-                                and _leaf_name(path) in _AMOUNT_FIELDS
-                                else _infer_currency(chosen or "")
+                                metric_currency
+                                if tool_name == "get_sec_filings"
+                                and path.startswith("data.metric.points[")
+                                and path.endswith("].val")
+                                else (
+                                    declared_currency
+                                    if declared_currency
+                                    and _leaf_name(path) in _AMOUNT_FIELDS
+                                    else _infer_currency(chosen or "")
+                                )
                             )
                         ),
                         venue=_infer_venue(chosen or ""),
@@ -1685,6 +1787,13 @@ class _EvidenceMixin:
                     ),
                     timestamp,
                 )
+                if tool_name == "read_url" and local_timestamp == timestamp:
+                    for key, item in value.items():
+                        if str(key).casefold() != "ts" or not isinstance(item, str):
+                            continue
+                        if _epoch_value(item) is not None:
+                            local_timestamp = item.strip()
+                        break
                 next_symbol = active_symbol
                 if tool_name == "read_url":
                     named = _object_instrument(value)

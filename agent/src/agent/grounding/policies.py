@@ -29,11 +29,13 @@ from src.agent.grounding.evidence import (
     _is_metadata_count_leaf,
     _is_number,
     _is_price_kind,
+    _is_source_epoch,
     _keyed_metric_map_kind,
     _metric_kind_for_path,
     _price_field_for_path,
     _timestamp_matches_claim_date,
     tail_risk_identity,
+    utc_restatement_mismatch,
 )
 from src.agent.grounding.figures import (
     ROUNDED_BAND,
@@ -590,7 +592,15 @@ class _PolicyMixin:
             if figure.shape == "bare" and not self._poses_as_price(
                 figure, self._price_band(symbol, records)
             ):
-                continue
+                # A 10- or 13-digit source instant is not a price, but a
+                # declared observation of one is still a claim. Other bare
+                # integers (counts, windows) stay unchecked.
+                if not (
+                    declaration is not None
+                    and declaration.role == "observed"
+                    and _is_source_epoch(figure.value)
+                ):
+                    continue
             if declaration is not None:
                 found = GROUNDING_CHECKS.run(
                     "figure-symbol", self, content, figure, declaration, symbol, line_symbols, symbol_records,
@@ -655,6 +665,21 @@ class _PolicyMixin:
                     GROUNDING_CHECKS.run("figure-proposed", self, figure, declaration, symbol, records, scalar_parameters)
                 )
                 continue
+            if _is_source_epoch(figure.value):
+                left, right = segment_bounds(content, figure.start, figure.end)
+                if utc_restatement_mismatch(content[left:right], int(figure.value)):
+                    issues.append(
+                        self._figure_issue(
+                            "numeric_claim_conflict",
+                            figure,
+                            "observed",
+                            symbol,
+                            "timestamp_format_mismatch",
+                            "names a clock time that is not this source instant; "
+                            "cite the ts digits, or render that same instant",
+                        )
+                    )
+                    continue
             issues.extend(GROUNDING_CHECKS.run("figure-observed", self, figure, declaration, symbol, records))
         market_records = self._price_records()
         if checked_price and market_records:
@@ -1614,7 +1639,13 @@ class _PolicyMixin:
         Both are held to the digits the figure was written with
         (:meth:`_within_written_precision`); ``legacy_direct`` keeps the flat evidence
         band for ``direct`` when it is an undeclared price checked against prints.
+        A source instant is not a price: the 0.5% band on a millisecond timestamp
+        is days wide, so only the same integer instant matches, and only an
+        evidence value that is itself an instant.
         """
+        if _is_source_epoch(figure.value):
+            wanted = int(figure.value)
+            return any(_is_source_epoch(target) and int(target) == wanted for target in direct)
         if legacy_direct:
             if _close_any(figure.value, direct):
                 return True

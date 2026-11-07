@@ -176,8 +176,14 @@ def test_markdown_wrapped_ticker_json_keeps_quoted_ohlc_and_drops_length(tmp_pat
     btc_last = next(record for record in ledger._evidence if record.call_id == "btc" and record.field.endswith(".last"))
     assert btc_last.symbol == "BTC-USDT"
     assert btc_last.value == 76025.6
-    # String-encoded volume and timestamp are not quote leaves and stay out.
-    assert all(record.field.rsplit(".", 1)[-1] not in {"vol24h", "ts", "code"} for record in ledger._evidence)
+    # Volume and the status code stay out. ``ts`` is source time, not a quote.
+    assert all(record.field.rsplit(".", 1)[-1] not in {"vol24h", "code"} for record in ledger._evidence)
+    eth_ts = next(record for record in ledger._evidence if record.call_id == "eth" and record.field.endswith(".ts"))
+    assert eth_ts.value == 1700000000000
+    assert eth_ts.symbol == "ETH-USDT"
+    assert eth_ts.currency is None
+    assert eth_ts not in ledger._price_records()
+    assert eth_last.timestamp == "1700000000000"
 
     result = ledger.validate_final_answer(_answer(ETH_PROSE + "\n" + BTC_PROSE, *ETH_ROWS, *BTC_ROWS))
 
@@ -531,6 +537,168 @@ def test_reader_json_scan_and_walk_are_bounded(tmp_path: Path, monkeypatch: pyte
         success=True,
     )
     assert not any(record.value == 2246.35 for record in ledger._evidence)
+
+
+# Source times from the 2026-11-07 acceptance window, labelled synthetic here.
+# 1794055824067 ms == 2026-11-07T12:50:24.067Z == 2026-11-07T20:50:24.067+08:00.
+ETH_TS = "1794055824067"
+BTC_TS = "1794055824074"
+ETH_UTC = "2026-11-07T12:50:24.067Z"
+ETH_SGT = "2026-11-07T20:50:24.067+08:00"
+
+
+def _acceptance_ticker(inst_id: str, quotes: dict[str, str], ts: str) -> dict[str, Any]:
+    row = {"instId": inst_id, "ts": ts, "vol24h": VOLUME, **quotes}
+    return {"code": "0", "data": [row]}
+
+
+def test_source_ts_is_kept_for_its_own_call_and_symbol(tmp_path: Path) -> None:
+    """A declared source instant is evidence. It is not a price and not portable."""
+    eth_json = json.dumps(
+        _acceptance_ticker(
+            "ETH-USDT",
+            {"last": "2241.08", "open24h": "2238.04", "high24h": "2254.25", "low24h": "2210.17"},
+            ETH_TS,
+        )
+    )
+    btc_json = json.dumps(
+        _acceptance_ticker(
+            "BTC-USDT",
+            {"last": "75883.7", "open24h": "76072", "high24h": "76251.1", "low24h": "74887.9"},
+            BTC_TS,
+        )
+    )
+    ledger = _ingest(
+        tmp_path,
+        [
+            ("eth", ETH_MY_URL, _envelope(ETH_MY_URL, eth_json, ETH_LENGTH, title="ETH-USDT")),
+            ("btc", BTC_MY_URL, _envelope(BTC_MY_URL, btc_json, BTC_LENGTH, title="BTC-USDT")),
+        ],
+    )
+    eth_ts = next(record for record in ledger._evidence if record.call_id == "eth" and record.field.endswith(".ts"))
+    btc_ts = next(record for record in ledger._evidence if record.call_id == "btc" and record.field.endswith(".ts"))
+    assert (eth_ts.value, eth_ts.symbol, eth_ts.currency, eth_ts.status) == (
+        1794055824067, "ETH-USDT", None, "observed",
+    )
+    assert (btc_ts.value, btc_ts.symbol) == (1794055824074, "BTC-USDT")
+    assert eth_ts.source == "okx" and btc_ts.source == "okx"
+    assert eth_ts not in ledger._price_records()
+    assert not any(record.value in {ETH_LENGTH, BTC_LENGTH} for record in ledger._evidence)
+    quote = next(record for record in ledger._evidence if record.call_id == "eth" and record.field.endswith(".last"))
+    assert quote.timestamp == ETH_TS
+    assert quote.value == 2241.08
+    assert quote.currency == "USDT"
+
+    prose = (
+        "ETH-USDT (OKX, USDT) last 2241.08, open 2238.04, high 2254.25, low 2210.17, "
+        "source time 1794055824067.\n"
+        "BTC-USDT (OKX, USDT) last 75883.7, open 76072, high 76251.1, low 74887.9, "
+        "source time 1794055824074.\n"
+        "ETH-USDT (OKX) high-low gap is 44.08 USDT."
+    )
+    rows = (
+        "2241.08 | observed | ETH-USDT last | eth::last",
+        "2238.04 | observed | ETH-USDT open | eth::open24h",
+        "2254.25 | observed | ETH-USDT high | eth::high24h",
+        "2210.17 | observed | ETH-USDT low | eth::low24h",
+        "1794055824067 | observed | ETH-USDT ts | eth::ts",
+        "75883.7 | observed | BTC-USDT last | btc::last",
+        "76072 | observed | BTC-USDT open | btc::open24h",
+        "76251.1 | observed | BTC-USDT high | btc::high24h",
+        "74887.9 | observed | BTC-USDT low | btc::low24h",
+        "1794055824074 | observed | BTC-USDT ts | btc::ts",
+        "44.08 | derived | 2254.25 - 2210.17 | eth",
+    )
+    kept = ledger.validate_final_answer(_answer(prose, *rows))
+    assert kept.valid is True, kept.issues
+
+    grouped = ledger.validate_final_answer(
+        _answer(
+            "ETH-USDT (OKX, USDT) source time 1,794,055,824,067.",
+            "1,794,055,824,067 | observed | ETH-USDT ts | eth::ts",
+        )
+    )
+    assert grouped.valid is True, grouped.issues
+
+    with_utc = ledger.validate_final_answer(
+        _answer(
+            f"ETH-USDT (OKX, USDT) source time 1794055824067 ({ETH_UTC}).",
+            "1794055824067 | observed | ETH-USDT ts | eth::ts",
+        )
+    )
+    assert with_utc.valid is True, with_utc.issues
+    with_sgt = ledger.validate_final_answer(
+        _answer(
+            f"ETH-USDT (OKX, USDT) source time 1794055824067 ({ETH_SGT}).",
+            "1794055824067 | observed | ETH-USDT ts | eth::ts",
+        )
+    )
+    assert with_sgt.valid is True, with_sgt.issues
+
+    wrong_clock = ledger.validate_final_answer(
+        _answer(
+            "ETH-USDT (OKX, USDT) source time 1794055824067 (2026-11-07T12:50:24.000Z).",
+            "1794055824067 | observed | ETH-USDT ts | eth::ts",
+        )
+    )
+    assert _reasons(wrong_clock) == ["timestamp_format_mismatch"]
+
+    invented = ledger.validate_final_answer(
+        _answer(
+            "ETH-USDT (OKX, USDT) source time 1794055824999.",
+            "1794055824999 | observed | ETH-USDT ts | eth::ts",
+        )
+    )
+    swapped_call = ledger.validate_final_answer(
+        _answer(
+            "BTC-USDT (OKX, USDT) source time 1794055824074.",
+            "1794055824074 | observed | BTC-USDT ts | eth::ts",
+        )
+    )
+    attributed_to_eth = ledger.validate_final_answer(
+        _answer(
+            "ETH-USDT (OKX, USDT) source time 1794055824074.",
+            "1794055824074 | observed | ETH-USDT ts | btc::ts",
+        )
+    )
+    as_price = ledger.validate_final_answer(
+        _answer(
+            "ETH-USDT (OKX, USDT) last 1794055824067.",
+            "1794055824067 | observed | ETH-USDT last | eth::last",
+        )
+    )
+    length_as_ts = ledger.validate_final_answer(
+        _answer(
+            "ETH-USDT (OKX, USDT) source time 453.0.",
+            "453.0 | observed | ETH-USDT ts | eth::ts",
+        )
+    )
+    assert _reasons(invented) == ["not_in_referenced_call"]
+    assert _reasons(swapped_call) == ["not_in_referenced_call"]
+    assert _reasons(attributed_to_eth) == ["not_in_referenced_call"]
+    assert "ETH-USDT" in attributed_to_eth.issues[0]["message"]
+    assert _reasons(as_price) == ["not_in_referenced_call"]
+    assert _reasons(length_as_ts) == ["not_in_referenced_call"]
+    assert not any(record.value == 453 for record in ledger._evidence)
+
+
+def test_a_calendar_rendering_without_the_ts_digits_is_not_checked() -> None:
+    """A clock string is not a substitute for the source digits."""
+    from src.agent.grounding.figures import parse_figures_block, scan_figures
+
+    text = f"ETH-USDT source time {ETH_UTC}."
+    measured = [figure for figure in scan_figures(text, parse_figures_block(text)) if figure.shape == "measured"]
+    assert measured == []
+
+
+def test_non_epoch_ts_string_is_not_evidence(tmp_path: Path) -> None:
+    body = json.dumps({"data": [{"instId": "ETH-USDT", "ts": "453", "last": "2241.08"}]})
+    ledger = _ingest(
+        tmp_path,
+        [("eth", ETH_MY_URL, _envelope(ETH_MY_URL, body, ETH_LENGTH, title="ETH-USDT"))],
+    )
+    assert not any(record.field.endswith(".ts") or record.value == 453 for record in ledger._evidence)
+    assert any(record.value == 2241.08 for record in ledger._evidence)
 
 
 class _Response:
