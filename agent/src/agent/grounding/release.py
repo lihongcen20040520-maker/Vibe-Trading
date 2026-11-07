@@ -93,6 +93,7 @@ _CORRECTION_REASONS = {
     "proposed_not_a_price": "a proposed level is a price, not a percentage; state the price it implies",
     "symbol_mismatch": "it is declared for one instrument but the sentence writes it about another",
     "citation_not_visible": "its source is not named on the figure's own line, and the note is stripped before the user reads the answer",
+    "timestamp_format_mismatch": "its clock time is not the referenced source instant; cite the ts digits, or render that exact instant",
 }
 
 

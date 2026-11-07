@@ -172,7 +172,10 @@ class FiguresBlock:
         point figure ("1.13个百分点", "3.6pp") carries its unit in words, so the
         convention declares it bare ("1.13"), and a same-valued bare declaration
         may ground it (#2107). A bare figure never borrows a percent
-        declaration. An exact value (tolerance 1e-9) always wins. Failing
+        declaration. An exact value (tolerance 1e-9) always wins. Two whole
+        numbers are exact only when the integers are equal: a relative 1e-9 on
+        a millisecond timestamp is more than a second, and would bind one
+        instrument's source time to the other's declaration. Failing
         that, a figure written with decimals ("38,68") covers a declaration holding
         the precise observation ("38.68005857871268") when it is that value correctly
         rounded to the digits written: within half a unit of its last decimal, and
@@ -198,7 +201,7 @@ class FiguresBlock:
         # drift onto a nearby delta.
         candidates = [item for item in self.declarations if item.percent == percent]
         for declaration in candidates:
-            if abs(declaration.value - value) <= max(abs(value) * 1e-9, 1e-9):
+            if _same_exact_value(declaration.value, value):
                 return declaration
         if digits and "." in digits:
             half_unit = 0.5 * 10.0 ** -len(digits.split(".", 1)[1])
@@ -215,11 +218,21 @@ class FiguresBlock:
         # case — its conventionally bare declaration lives below.
         if point_marked and percent:
             for declaration in self.declarations:
-                if not declaration.percent and abs(declaration.value - value) <= max(
-                    abs(value) * 1e-9, 1e-9
-                ):
+                if not declaration.percent and _same_exact_value(declaration.value, value):
                     return declaration
         return None
+
+
+def _same_exact_value(declared: float, prose: float) -> bool:
+    """Whether ``prose`` is the declared value, not merely a nearby large integer.
+
+    Non-integers keep the 1e-9 relative band so float noise still matches.
+    Whole numbers match only as the same integer. Above the exact float range
+    the relative band remains, because those magnitudes are not exact integers.
+    """
+    if abs(declared) <= 2**53 and abs(prose) <= 2**53 and declared == int(declared) and prose == int(prose):
+        return int(declared) == int(prose)
+    return abs(declared - prose) <= max(abs(prose) * 1e-9, 1e-9)
 
 
 @dataclass(frozen=True)
