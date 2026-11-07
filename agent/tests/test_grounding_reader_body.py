@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 import pytest
 
+import src.agent.grounding.evidence as reader_evidence
 from src.agent.grounding import GroundingLedger
 from src.agent.loop import AgentLoop
 from src.agent.tools import BaseTool, ToolRegistry
@@ -43,6 +44,10 @@ ETH_LENGTH = 453
 BTC_LENGTH = 460
 ETH_URL = "https://www.okx.com/api/v5/market/ticker?instId=ETH-USDT"
 BTC_URL = "https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT"
+# The public ticker host the isolated run actually calls. Provenance is the
+# registrable venue id ``okx``, not the tool name ``read_url``.
+ETH_MY_URL = "https://my.okx.com/api/v5/market/ticker?instId=ETH-USDT"
+BTC_MY_URL = "https://my.okx.com/api/v5/market/ticker?instId=BTC-USDT"
 VOLUME = "12345.6"
 
 
@@ -373,6 +378,161 @@ def test_another_tool_string_body_is_not_indexed(tmp_path: Path) -> None:
     assert "not_in_referenced_call" in _reasons(result)
 
 
+def test_my_okx_host_instid_query_source_is_okx_and_must_be_named(tmp_path: Path) -> None:
+    """``my.okx.com?instId=`` is source okx. Naming OKX passes; naming only the tool does not."""
+    assert "instId=ETH-USDT" in ETH_MY_URL and "instId=BTC-USDT" in BTC_MY_URL
+    eth = json.loads(_envelope(ETH_MY_URL, _markdown(ETH_MY_URL, "ETH-USDT", ETH_QUOTES), ETH_LENGTH, title="ETH-USDT"))
+    btc = json.loads(_envelope(BTC_MY_URL, _markdown(BTC_MY_URL, "BTC-USDT", BTC_QUOTES), BTC_LENGTH, title="BTC-USDT"))
+    eth["headers"] = {"content-length": ETH_LENGTH, "elapsed_ms": 12}
+    btc["headers"] = {"content-length": BTC_LENGTH, "elapsed_ms": 12}
+    ledger = _ingest(
+        tmp_path,
+        [
+            ("eth", ETH_MY_URL, json.dumps(eth)),
+            ("btc", BTC_MY_URL, json.dumps(btc)),
+        ],
+    )
+    eth_last = next(record for record in ledger._evidence if record.call_id == "eth" and record.field.endswith(".last"))
+    btc_last = next(record for record in ledger._evidence if record.call_id == "btc" and record.field.endswith(".last"))
+    assert eth_last.source == "okx" and btc_last.source == "okx"
+    assert eth_last.tool == "read_url" and btc_last.tool == "read_url"
+    assert eth_last.symbol == "ETH-USDT" and btc_last.symbol == "BTC-USDT"
+    assert eth_last.value == 2246.35 and btc_last.value == 76025.6
+    assert not any(record.value in {ETH_LENGTH, BTC_LENGTH, 12} for record in ledger._evidence)
+
+    named = ledger.validate_final_answer(_answer(ETH_PROSE + "\n" + BTC_PROSE, *ETH_ROWS, *BTC_ROWS))
+    assert named.valid is True, named.issues
+
+    tool_name_only = (
+        "ETH-USDT (read_url) last 2246.35 USDT, open 2210.17 USDT, "
+        "high 2254.25 USDT, low 2198.40 USDT.\n"
+        "BTC-USDT (read_url) last 76025.6 USDT, open 74887.9 USDT, "
+        "high 76171.7 USDT, low 74512.3 USDT."
+    )
+    unnamed = ledger.validate_final_answer(_answer(tool_name_only, *ETH_ROWS, *BTC_ROWS))
+    assert unnamed.valid is False
+    assert any(issue.get("code") == "data_source_not_surfaced" for issue in unnamed.issues)
+    assert "not_in_referenced_call" not in _reasons(unnamed)
+
+    borrowed = ledger.validate_final_answer(
+        _answer(
+            "ETH-USDT (OKX) last 76025.6 USDT.",
+            "76025.6 | observed | ETH-USDT last | btc::last",
+        )
+    )
+    assert _reasons(borrowed) == ["not_in_referenced_call"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://my.okx.com.evil.example/api/v5/market/ticker?instId=ETH-USDT",
+        "https://okx.com.evil.example/api/v5/market/ticker?instId=ETH-USDT",
+        "https://my.okx.com@evil.example/api/v5/market/ticker?instId=ETH-USDT",
+        "https://notokx.com/api/v5/market/ticker?instId=ETH-USDT",
+    ],
+)
+def test_lookalike_host_stays_read_url(tmp_path: Path, url: str) -> None:
+    """The okx source is the hostname, not the letters okx.com somewhere in the URL."""
+    ledger = _ingest(
+        tmp_path,
+        [("eth", url, _envelope(url, _markdown(url, "ETH-USDT", ETH_QUOTES), ETH_LENGTH, title="ETH-USDT"))],
+    )
+    last = next(record for record in ledger._evidence if record.field.endswith(".last"))
+    assert last.source == "read_url"
+    assert last.symbol == "ETH-USDT"
+    assert last.value == 2246.35
+    via_tool = ledger.validate_final_answer(
+        _answer(
+            "ETH-USDT (read_url) last 2246.35 USDT, open 2210.17 USDT, high 2254.25 USDT, low 2198.40 USDT.",
+            *ETH_ROWS,
+        )
+    )
+    assert via_tool.valid is True, via_tool.issues
+    via_okx = ledger.validate_final_answer(
+        _answer(
+            "ETH-USDT (OKX) last 2246.35 USDT, open 2210.17 USDT, high 2254.25 USDT, low 2198.40 USDT.",
+            *ETH_ROWS,
+        )
+    )
+    assert via_okx.valid is False
+    assert any(issue.get("code") == "data_source_not_surfaced" for issue in via_okx.issues)
+
+
+def test_unlabeled_print_in_a_multi_instrument_body_is_not_evidence(tmp_path: Path) -> None:
+    """A second instrument's number without instId does not inherit the URL symbol."""
+    body = {
+        "data": [
+            {
+                "instId": "ETH-USDT",
+                "last": "2246.35",
+                "open24h": "2210.17",
+                "high24h": "2254.25",
+                "low24h": "2198.40",
+            },
+            {
+                "instId": "BTC-USDT",
+                "last": "76025.6",
+                "open24h": "74887.9",
+                "high24h": "76171.7",
+                "low24h": "74512.3",
+            },
+            {"last": "1111.11"},
+        ]
+    }
+    ledger = _ingest(
+        tmp_path,
+        [("page", ETH_MY_URL, _envelope(ETH_MY_URL, json.dumps(body), ETH_LENGTH, title="tickers"))],
+    )
+    assert not any(record.value == 1111.11 for record in ledger._evidence)
+    assert {record.symbol for record in ledger._evidence} == {"ETH-USDT", "BTC-USDT"}
+    kept = ledger.validate_final_answer(
+        _answer(
+            "ETH-USDT (OKX) last 2246.35 USDT.\nBTC-USDT (OKX) last 76025.6 USDT.",
+            "2246.35 | observed | ETH-USDT last | page::last",
+            "76025.6 | observed | BTC-USDT last | page::last",
+        )
+    )
+    assert kept.valid is True, kept.issues
+    unlabeled = ledger.validate_final_answer(
+        _answer(
+            "ETH-USDT (OKX) last 1111.11 USDT.",
+            "1111.11 | observed | ETH-USDT last | page::last",
+        )
+    )
+    assert _reasons(unlabeled) == ["not_in_referenced_call"]
+    crossed = ledger.validate_final_answer(
+        _answer(
+            "ETH-USDT (OKX) last 76025.6 USDT.",
+            "76025.6 | observed | ETH-USDT last | page::last",
+        )
+    )
+    assert _reasons(crossed) == ["not_in_referenced_call"]
+
+
+def test_reader_json_scan_and_walk_are_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A late or very deep body cannot add prints or raise."""
+    late = ("x" * 40) + _json_text("ETH-USDT", ETH_QUOTES)
+    assert reader_evidence._json_documents(late)
+    monkeypatch.setattr(reader_evidence, "_MAX_READER_BODY_CHARS", 24)
+    assert reader_evidence._json_documents(late) == []
+
+    node: Any = {"instId": "ETH-USDT", "last": "2246.35"}
+    for _ in range(40):
+        node = {"nest": node}
+    ledger = GroundingLedger(run_dir=tmp_path, user_message="Report the ETH-USDT ticker.")
+    ledger.ingest_tool_result(
+        tool_name="read_url",
+        arguments={"url": ETH_MY_URL},
+        result=json.dumps(
+            {"status": "ok", "url": ETH_MY_URL, "content": node, "length": ETH_LENGTH}
+        ),
+        call_id="deep",
+        success=True,
+    )
+    assert not any(record.value == 2246.35 for record in ledger._evidence)
+
+
 class _Response:
     def __init__(self, *, content: str = "", tool_calls: list[SimpleNamespace] | None = None) -> None:
         self.content = content
@@ -422,10 +582,10 @@ class _ReaderTool(BaseTool):
 
     def execute(self, **kwargs: Any) -> str:
         url = str(kwargs.get("url") or "")
-        if "ETH-USDT" in url:
-            return _envelope(ETH_URL, _markdown(ETH_URL, "ETH-USDT", ETH_QUOTES), ETH_LENGTH, title="ETH-USDT")
-        if "BTC-USDT" in url:
-            return _envelope(BTC_URL, _markdown(BTC_URL, "BTC-USDT", BTC_QUOTES), BTC_LENGTH, title="BTC-USDT")
+        if "instId=ETH-USDT" in url:
+            return _envelope(url, _markdown(url, "ETH-USDT", ETH_QUOTES), ETH_LENGTH, title="ETH-USDT")
+        if "instId=BTC-USDT" in url:
+            return _envelope(url, _markdown(url, "BTC-USDT", BTC_QUOTES), BTC_LENGTH, title="BTC-USDT")
         return json.dumps({"status": "error", "error": "synthetic fixture has no such url"})
 
 
@@ -451,8 +611,8 @@ def test_offline_loop_retains_sourced_prints_without_degrading(tmp_path: Path) -
     result = _run(
         tmp_path,
         [
-            _Response(tool_calls=[_tool_call("eth", ETH_URL)]),
-            _Response(tool_calls=[_tool_call("btc", BTC_URL)]),
+            _Response(tool_calls=[_tool_call("eth", ETH_MY_URL)]),
+            _Response(tool_calls=[_tool_call("btc", BTC_MY_URL)]),
             _Response(content=_OBSERVED_ANSWER),
         ],
     )
@@ -476,8 +636,8 @@ def test_offline_loop_still_redacts_a_fabricated_print(tmp_path: Path) -> None:
     result = _run(
         tmp_path,
         [
-            _Response(tool_calls=[_tool_call("eth", ETH_URL)]),
-            _Response(tool_calls=[_tool_call("btc", BTC_URL)]),
+            _Response(tool_calls=[_tool_call("eth", ETH_MY_URL)]),
+            _Response(tool_calls=[_tool_call("btc", BTC_MY_URL)]),
             _Response(content=invented),
         ],
     )

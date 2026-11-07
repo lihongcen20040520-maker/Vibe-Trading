@@ -420,6 +420,11 @@ _READER_INSTRUMENT_KEYS = ("instid", "inst_id", "symbol", "instrument", "ticker"
 _READER_HOST_SOURCES = (("okx.com", "okx"),)
 _MAX_EMBEDDED_JSON = 8
 _MAX_JSON_TEXT_DEPTH = 2
+# Reader text is untrusted. The scan and the walk are capped so a huge or
+# deeply nested body cannot pin the process; anything past the cap is not
+# evidence, which is the closed direction.
+_MAX_READER_BODY_CHARS = 65_536
+_MAX_READER_WALK_DEPTH = 32
 _FENCED_JSON_RE = re.compile(
     r"^```(?:json)?\s*\n?(.*?)\n?```$",
     re.DOTALL | re.IGNORECASE,
@@ -446,28 +451,78 @@ def _object_instrument(value: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _reader_url(arguments: Mapping[str, Any], payload: Mapping[str, Any]) -> str:
+    """The URL the reader was given, from the arguments or the envelope."""
+    raw = arguments.get("url") if isinstance(arguments.get("url"), str) else payload.get("url")
+    return raw.strip() if isinstance(raw, str) else ""
+
+
 def _reader_source(
     payload: Mapping[str, Any], arguments: Mapping[str, Any], tool_name: str
 ) -> str:
     """Venue named by a reader URL, else the tool that fetched the body.
 
-    An explicit ``source`` on the envelope wins. Otherwise a public OKX ticker
-    URL is source ``okx`` — the same id ``get_market_data`` records — while the
-    evidence row's tool stays ``read_url``.
+    An explicit ``source`` on the envelope wins. Otherwise the hostname decides.
+    ``okx.com`` and any subdomain, including the public ticker host
+    ``my.okx.com``, are source ``okx`` — the same id ``get_market_data``
+    records. A lookalike host (``okx.com.evil.example``, userinfo that only
+    displays ``my.okx.com``) stays ``read_url``. The evidence row's tool is
+    still ``read_url``.
     """
     explicit = payload.get("source")
     if isinstance(explicit, str) and explicit.strip():
         named = explicit.strip()
         if named.casefold() not in {"auto", "unknown"}:
             return named
-    raw = arguments.get("url") if isinstance(arguments.get("url"), str) else payload.get("url")
-    host = ""
-    if isinstance(raw, str) and raw.strip():
-        host = (urlsplit(raw.strip()).hostname or "").lower().rstrip(".")
+    host = (urlsplit(_reader_url(arguments, payload)).hostname or "").lower().rstrip(".")
     for suffix, source in _READER_HOST_SOURCES:
         if host == suffix or host.endswith("." + suffix):
             return source
     return tool_name
+
+
+def _reader_symbols(
+    arguments: Mapping[str, Any], payload: Mapping[str, Any]
+) -> tuple[set[str], bool]:
+    """Symbols written in the reader URL or body, and whether the scan was cut.
+
+    The scan stops after :data:`_MAX_READER_BODY_CHARS`. A cut scan is not
+    treated as "only one symbol": a second instrument past the cap must not
+    inherit the URL's symbol.
+    """
+    blobs: list[str] = []
+    url = _reader_url(arguments, payload)
+    if url:
+        blobs.append(url)
+
+    def collect(value: Any, depth: int = 0) -> None:
+        if depth > _MAX_READER_WALK_DEPTH:
+            return
+        if isinstance(value, str):
+            blobs.append(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                collect(item, depth + 1)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item, depth + 1)
+
+    for key, item in payload.items():
+        if str(key).casefold() in _READER_BODY_FIELDS:
+            collect(item)
+    found: set[str] = set()
+    budget = _MAX_READER_BODY_CHARS
+    truncated = False
+    for blob in blobs:
+        if budget <= 0:
+            truncated = True
+            break
+        piece = blob if len(blob) <= budget else blob[:budget]
+        if len(piece) < len(blob):
+            truncated = True
+        budget -= len(piece)
+        found |= _scan_symbols(piece)
+    return found, truncated
 
 
 def _is_reader_metadata(path: str) -> bool:
@@ -505,6 +560,8 @@ def _json_documents(text: str, depth: int = 0) -> list[Any]:
     """
     if depth > _MAX_JSON_TEXT_DEPTH or not isinstance(text, str):
         return []
+    if len(text) > _MAX_READER_BODY_CHARS:
+        text = text[:_MAX_READER_BODY_CHARS]
     stripped = text.strip()
     if not stripped:
         return []
@@ -1523,12 +1580,15 @@ class _EvidenceMixin:
                 self._match_authorized_symbol(symbol, self.authorized_symbols) or symbol
             )
         source = str(payload.get("source") or tool_name)
+        # More than one instrument in the body: a number with no instId of its
+        # own is not attributed to the URL's symbol, and is not recorded.
+        multi_instrument = False
         if tool_name == "read_url":
             source = _reader_source(payload, arguments, tool_name)
-            if symbol is None:
-                symbol = _single_symbol(str(arguments.get("url") or "")) or _single_symbol(
-                    str(payload.get("url") or "")
-                )
+            reader_symbols, symbols_truncated = _reader_symbols(arguments, payload)
+            if symbol is None and len(reader_symbols) == 1 and not symbols_truncated:
+                symbol = next(iter(reader_symbols))
+            multi_instrument = len(reader_symbols) > 1 or symbols_truncated
         remaining = _MAX_GENERIC_EVIDENCE
         timestamp_fields = (*_TIMESTAMP_FIELDS, "latest_date", "as_of")
         data = payload.get("data")
@@ -1543,11 +1603,15 @@ class _EvidenceMixin:
             timestamp: str | None = None,
             declared_currency: str | None = None,
             active_symbol: str | None = None,
+            depth: int = 0,
         ) -> None:
             nonlocal remaining
             if remaining <= 0:
                 return
+            if tool_name == "read_url" and depth > _MAX_READER_WALK_DEPTH:
+                return
             chosen = symbol if active_symbol is None else active_symbol
+            next_depth = depth + 1 if tool_name == "read_url" else depth
             if isinstance(value, str) and tool_name == "read_url":
                 if _leaf_name(path) in _READER_BODY_FIELDS:
                     documents = _json_documents(value)
@@ -1559,14 +1623,24 @@ class _EvidenceMixin:
                                 timestamp,
                                 declared_currency,
                                 active_symbol,
+                                next_depth,
                             )
                         return
                 coerced = _coerce_quote_text(path, value)
                 if coerced is not None:
-                    visit(coerced, path, timestamp, declared_currency, active_symbol)
+                    visit(
+                        coerced,
+                        path,
+                        timestamp,
+                        declared_currency,
+                        active_symbol,
+                        next_depth,
+                    )
                 return
             if _is_number(value):
-                if tool_name == "read_url" and _is_reader_metadata(path):
+                if tool_name == "read_url" and (
+                    _is_reader_metadata(path) or (multi_instrument and not chosen)
+                ):
                     return
                 self._evidence.append(
                     EvidenceRecord(
@@ -1630,6 +1704,7 @@ class _EvidenceMixin:
                         local_timestamp,
                         local_currency,
                         next_symbol,
+                        next_depth,
                     )
             elif isinstance(value, list):
                 for index, item in enumerate(value):
@@ -1639,9 +1714,14 @@ class _EvidenceMixin:
                         timestamp,
                         declared_currency,
                         active_symbol,
+                        next_depth,
                     )
 
-        visit(payload, "", active_symbol=symbol if tool_name == "read_url" else None)
+        visit(
+            payload,
+            "",
+            active_symbol=symbol if tool_name == "read_url" else None,
+        )
 
     def _ingest_run_dir_ohlc_csvs(self) -> None:
         """Register OHLC rows from per-symbol CSVs the run wrote via bash+yfinance.
