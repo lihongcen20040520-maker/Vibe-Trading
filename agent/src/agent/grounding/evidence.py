@@ -15,6 +15,7 @@ import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 from src.agent.grounding.figures import (
     Figure,
@@ -27,6 +28,7 @@ from src.agent.grounding.identity import (
     _infer_currency,
     _infer_venue,
     _normalize_symbol,
+    _scan_symbols,
     _utc_now,
 )
 
@@ -102,6 +104,17 @@ _GENERIC_PRICE_FIELD_ALIASES = {
     "latest_price": "price",
     "current_price": "price",
     "market_price": "price",
+    # Venue tickers spell the same OHLC print with a window suffix. OKX's
+    # public ticker uses open24h / high24h / low24h beside last; the leaf is
+    # still that print, not a second kind of number.
+    "open24h": "open",
+    "high24h": "high",
+    "low24h": "low",
+    "close24h": "close",
+    "open_24h": "open",
+    "high_24h": "high",
+    "low_24h": "low",
+    "close_24h": "close",
     "settle": "price",
     "settlement": "price",
     "settle_price": "price",
@@ -383,6 +396,153 @@ def _json_object(value: Any) -> dict[str, Any] | None:
     except (json.JSONDecodeError, TypeError):
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+# ``read_url`` returns a reader envelope. The page or API payload is a string
+# (``content`` / ``text`` / ``markdown`` / ``body``), often JSON or markdown
+# wrapped around JSON. ``length`` is the character count of that text. Indexing
+# only JSON numbers therefore kept the wrapper length and dropped every print
+# inside the body.
+_READER_BODY_FIELDS = frozenset({"content", "text", "markdown", "body"})
+_READER_METADATA_FIELDS = frozenset(
+    {
+        "length",
+        "content_length",
+        "bytes",
+        "status_code",
+        "http_status",
+        "elapsed_ms",
+        "elapsed_seconds",
+        "duration_seconds",
+    }
+)
+_READER_INSTRUMENT_KEYS = ("instid", "inst_id", "symbol", "instrument", "ticker")
+_READER_HOST_SOURCES = (("okx.com", "okx"),)
+_MAX_EMBEDDED_JSON = 8
+_MAX_JSON_TEXT_DEPTH = 2
+_FENCED_JSON_RE = re.compile(
+    r"^```(?:json)?\s*\n?(.*?)\n?```$",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _single_symbol(text: str) -> str | None:
+    """Return the one canonical symbol written in ``text``, or None."""
+    found = _scan_symbols(text or "")
+    if len(found) != 1:
+        return None
+    return next(iter(found))
+
+
+def _object_instrument(value: Mapping[str, Any]) -> str | None:
+    """The instrument a ticker object names for the prints beside that name."""
+    folded = {str(key).casefold(): item for key, item in value.items()}
+    for key in _READER_INSTRUMENT_KEYS:
+        item = folded.get(key)
+        if isinstance(item, str):
+            symbol = _single_symbol(item)
+            if symbol:
+                return symbol
+    return None
+
+
+def _reader_source(
+    payload: Mapping[str, Any], arguments: Mapping[str, Any], tool_name: str
+) -> str:
+    """Venue named by a reader URL, else the tool that fetched the body.
+
+    An explicit ``source`` on the envelope wins. Otherwise a public OKX ticker
+    URL is source ``okx`` — the same id ``get_market_data`` records — while the
+    evidence row's tool stays ``read_url``.
+    """
+    explicit = payload.get("source")
+    if isinstance(explicit, str) and explicit.strip():
+        named = explicit.strip()
+        if named.casefold() not in {"auto", "unknown"}:
+            return named
+    raw = arguments.get("url") if isinstance(arguments.get("url"), str) else payload.get("url")
+    host = ""
+    if isinstance(raw, str) and raw.strip():
+        host = (urlsplit(raw.strip()).hostname or "").lower().rstrip(".")
+    for suffix, source in _READER_HOST_SOURCES:
+        if host == suffix or host.endswith("." + suffix):
+            return source
+    return tool_name
+
+
+def _is_reader_metadata(path: str) -> bool:
+    """Whether ``path`` is the reader envelope's own size or status, not the body.
+
+    A ``length`` leaf inside the parsed response body is that body's field.
+    The envelope's top-level ``length`` is how many characters the reader
+    returned and is not a market print.
+    """
+    leaf = _leaf_name(path).replace("-", "_")
+    if leaf not in _READER_METADATA_FIELDS:
+        return False
+    parts = re.split(r"[.\[]", path or "")
+    return not any(part.casefold() in _READER_BODY_FIELDS for part in parts)
+
+
+def _coerce_quote_text(path: str, value: str) -> float | None:
+    """Parse a quote leaf written as text (``\"2246.35\"``, ``\"2,246.35\"``).
+
+    Only unambiguous quote leaves are coerced. A status code, volume or
+    timestamp that the venue encoded as a string stays out of the ledger, so
+    a small integer in the body cannot satisfy a price citation by coincidence.
+    """
+    if _price_field_for_path(path) is None:
+        return None
+    return _coerce_csv_number(value)
+
+
+def _json_documents(text: str, depth: int = 0) -> list[Any]:
+    """JSON objects and arrays embedded in a reader body string.
+
+    The body may be the JSON text itself, a JSON string that decodes to that
+    text, a fenced block, or markdown with the JSON after a header. Non-JSON
+    prose contributes nothing: a page number in an article is not a print.
+    """
+    if depth > _MAX_JSON_TEXT_DEPTH or not isinstance(text, str):
+        return []
+    stripped = text.strip()
+    if not stripped:
+        return []
+    fenced = _FENCED_JSON_RE.fullmatch(stripped)
+    if fenced:
+        stripped = fenced.group(1).strip()
+        if not stripped:
+            return []
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, (dict, list)):
+        return [parsed]
+    if isinstance(parsed, str):
+        return _json_documents(parsed, depth + 1)
+    documents: list[Any] = []
+    decoder = json.JSONDecoder()
+    index = 0
+    length = len(stripped)
+    while index < length and len(documents) < _MAX_EMBEDDED_JSON:
+        start = stripped.find("{", index)
+        bracket = stripped.find("[", index)
+        if start < 0 or (bracket >= 0 and bracket < start):
+            start = bracket
+        if start < 0:
+            break
+        try:
+            value, end = decoder.raw_decode(stripped, start)
+        except json.JSONDecodeError:
+            index = start + 1
+            continue
+        if isinstance(value, (dict, list)):
+            documents.append(value)
+        elif isinstance(value, str) and len(documents) < _MAX_EMBEDDED_JSON:
+            documents.extend(_json_documents(value, depth + 1)[: _MAX_EMBEDDED_JSON - len(documents)])
+        index = max(end, start + 1)
+    return documents[:_MAX_EMBEDDED_JSON]
 
 
 def _is_number(value: Any) -> bool:
@@ -1348,7 +1508,14 @@ class _EvidenceMixin:
         payload: dict[str, Any],
         call_id: str,
     ) -> None:
-        """Flatten bounded numeric leaves from other market-sensitive tools."""
+        """Flatten bounded numeric leaves from other market-sensitive tools.
+
+        ``read_url`` is the exception to "numbers are JSON numbers". Its
+        envelope stores the response as text and the text's character count
+        as ``length``. Quote leaves inside that text (including JSON written
+        as a string, a fenced block, or markdown around a JSON object) are
+        observed prints of the call. The envelope's own ``length`` is not.
+        """
         symbols = self._extract_symbol_arguments(arguments)
         symbol = symbols[0] if len(symbols) == 1 else None
         if symbol:
@@ -1356,6 +1523,12 @@ class _EvidenceMixin:
                 self._match_authorized_symbol(symbol, self.authorized_symbols) or symbol
             )
         source = str(payload.get("source") or tool_name)
+        if tool_name == "read_url":
+            source = _reader_source(payload, arguments, tool_name)
+            if symbol is None:
+                symbol = _single_symbol(str(arguments.get("url") or "")) or _single_symbol(
+                    str(payload.get("url") or "")
+                )
         remaining = _MAX_GENERIC_EVIDENCE
         timestamp_fields = (*_TIMESTAMP_FIELDS, "latest_date", "as_of")
         data = payload.get("data")
@@ -1369,16 +1542,37 @@ class _EvidenceMixin:
             path: str,
             timestamp: str | None = None,
             declared_currency: str | None = None,
+            active_symbol: str | None = None,
         ) -> None:
             nonlocal remaining
             if remaining <= 0:
                 return
+            chosen = symbol if active_symbol is None else active_symbol
+            if isinstance(value, str) and tool_name == "read_url":
+                if _leaf_name(path) in _READER_BODY_FIELDS:
+                    documents = _json_documents(value)
+                    if documents:
+                        for document in documents:
+                            visit(
+                                document,
+                                path,
+                                timestamp,
+                                declared_currency,
+                                active_symbol,
+                            )
+                        return
+                coerced = _coerce_quote_text(path, value)
+                if coerced is not None:
+                    visit(coerced, path, timestamp, declared_currency, active_symbol)
+                return
             if _is_number(value):
+                if tool_name == "read_url" and _is_reader_metadata(path):
+                    return
                 self._evidence.append(
                     EvidenceRecord(
                         call_id=call_id,
                         tool=tool_name,
-                        symbol=symbol,
+                        symbol=chosen,
                         source=source,
                         timestamp=timestamp,
                         field=path or "value",
@@ -1393,10 +1587,10 @@ class _EvidenceMixin:
                                 declared_currency
                                 if declared_currency
                                 and _leaf_name(path) in _AMOUNT_FIELDS
-                                else _infer_currency(symbol or "")
+                                else _infer_currency(chosen or "")
                             )
                         ),
-                        venue=_infer_venue(symbol or ""),
+                        venue=_infer_venue(chosen or ""),
                     )
                 )
                 remaining -= 1
@@ -1417,22 +1611,37 @@ class _EvidenceMixin:
                     ),
                     timestamp,
                 )
+                next_symbol = active_symbol
+                if tool_name == "read_url":
+                    named = _object_instrument(value)
+                    if named:
+                        next_symbol = named
                 for key, item in value.items():
                     if str(key).casefold() in timestamp_fields:
                         continue
                     if not path and str(key).casefold() in _ENVELOPE_FIELDS:
                         continue
+                    child = f"{path}.{key}" if path else str(key)
+                    if tool_name == "read_url" and _is_reader_metadata(child):
+                        continue
                     visit(
                         item,
-                        f"{path}.{key}" if path else str(key),
+                        child,
                         local_timestamp,
                         local_currency,
+                        next_symbol,
                     )
             elif isinstance(value, list):
                 for index, item in enumerate(value):
-                    visit(item, f"{path}[{index}]", timestamp, declared_currency)
+                    visit(
+                        item,
+                        f"{path}[{index}]",
+                        timestamp,
+                        declared_currency,
+                        active_symbol,
+                    )
 
-        visit(payload, "")
+        visit(payload, "", active_symbol=symbol if tool_name == "read_url" else None)
 
     def _ingest_run_dir_ohlc_csvs(self) -> None:
         """Register OHLC rows from per-symbol CSVs the run wrote via bash+yfinance.
@@ -1506,13 +1715,27 @@ class _EvidenceMixin:
                     room -= 1
 
     def _price_records(self) -> list[EvidenceRecord]:
-        """Return observed OHLC/price evidence only."""
+        """Return observed OHLC/price evidence only.
+
+        ``read_url`` keeps the quote under the response path
+        (``content.data[0].last``) so a citation can name that field. The
+        path is still the print. Release and provenance read this list; if
+        the path were omitted, a sourced ticker would look like the session
+        had never observed a price and a later redaction would discard the
+        prints that did check out.
+        """
         return [
             record
             for record in self._evidence
             if record.status == "observed"
-            and record.field in _PRICE_FIELDS
             and record.value is not None
+            and (
+                record.field in _PRICE_FIELDS
+                or (
+                    record.tool == "read_url"
+                    and _price_field_for_path(record.field) is not None
+                )
+            )
         ]
 
     def _comparable_price_records(self) -> list[EvidenceRecord]:
